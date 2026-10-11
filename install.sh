@@ -45,25 +45,13 @@ EOF
 fi
 
 echo "Checking dependencies..."
-for cmd in hyprctl jq grim omarchy-menu-select; do
+for cmd in hyprctl jq omarchy-menu-select; do
   if command -v "$cmd" >/dev/null 2>&1; then
     echo "  ok: $cmd"
   else
     echo "  MISSING: $cmd"
   fi
 done
-for cmd in omarchy-menu-images vipsthumbnail; do
-  if command -v "$cmd" >/dev/null 2>&1; then
-    echo "  ok: $cmd (thumbnail grid)"
-  else
-    echo "  optional: $cmd not found (thumbnail grid disabled)"
-  fi
-done
-if command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1; then
-  echo "  ok: imagemagick (smaller previews)"
-else
-  echo "  optional: imagemagick not found"
-fi
 
 # Warn if an older `omaveil` earlier in PATH would shadow this install.
 resolved=$(command -v omaveil 2>/dev/null || true)

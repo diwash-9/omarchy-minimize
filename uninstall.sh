@@ -12,7 +12,6 @@ BIN_DIR="${HOME}/.local/bin"
 
 rm -f "$BIN_DIR/omaveil"
 rm -rf "${OMAVEIL_STATE_DIR:-/tmp/minimize-state}"
-rm -rf "${OMAVEIL_PREVIEW_DIR:-/tmp/window-previews}"
 rm -f "${OMAVEIL_LOG:-/tmp/omaveil.log}"
 rmdir "$BIN_DIR" 2>/dev/null || true
 

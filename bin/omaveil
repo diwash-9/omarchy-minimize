@@ -4,8 +4,7 @@
 #
 # Hyprland has no "minimize": windows are either on a workspace or hidden on a
 # special workspace. omaveil gives you a real minimize/restore workflow on top
-# of a dedicated special workspace, with an Omarchy-native picker and live
-# thumbnails of every hidden window.
+# of a dedicated special workspace, using Omarchy's native menu as the picker.
 #
 # Commands:
 #   minimize              Hide the focused window into special:minimum
@@ -17,16 +16,14 @@
 #
 # Environment overrides:
 #   OMAVEIL_STATE_DIR     where windows.json lives   (default /tmp/minimize-state)
-#   OMAVEIL_PREVIEW_DIR   where thumbnails live      (default /tmp/window-previews)
 #   OMAVEIL_LOG           error log                  (default /tmp/omaveil.log)
 #   OMAVEIL_WORKSPACE     special workspace name     (default minimum)
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 STATE_DIR="${OMAVEIL_STATE_DIR:-/tmp/minimize-state}"
-PREVIEW_DIR="${OMAVEIL_PREVIEW_DIR:-/tmp/window-previews}"
 STATE_FILE="$STATE_DIR/windows.json"
 LOG_FILE="${OMAVEIL_LOG:-/tmp/omaveil.log}"
 SPECIAL_WORKSPACE="${OMAVEIL_WORKSPACE:-minimum}"
@@ -90,7 +87,7 @@ icon_for_class() {
 }
 
 ensure_state() {
-  mkdir -p "$STATE_DIR" "$PREVIEW_DIR"
+  mkdir -p "$STATE_DIR"
   [ -f "$STATE_FILE" ] || printf '[]\n' >"$STATE_FILE"
 }
 
@@ -103,18 +100,15 @@ state_has_address() {
 }
 
 state_add() {
-  local address="$1" title="$2" class="$3" preview="$4" icon="$5"
-  jq --arg a "$address" --arg d "$title" --arg c "$class" --arg o "$title" --arg p "$preview" --arg i "$icon" \
-    '. + [{address:$a, display_title:$d, class:$c, original_title:$o, preview:$p, icon:$i}]' \
+  local address="$1" title="$2" class="$3" icon="$4"
+  jq --arg a "$address" --arg d "$title" --arg c "$class" --arg i "$icon" \
+    '. + [{address:$a, display_title:$d, class:$c, icon:$i}]' \
     "$STATE_FILE" >"$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
 }
 
 state_remove() {
-  local address="$1" preview
-  preview=$(jq -r --arg a "$address" '.[] | select(.address == $a) | .preview // empty' "$STATE_FILE" 2>/dev/null | head -n1)
+  local address="$1"
   jq --arg a "$address" 'map(select(.address != $a))' "$STATE_FILE" >"$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
-  [ -n "$preview" ] && rm -f "$preview"
-  return 0
 }
 
 # Move a window to a workspace: prefer Hyprland's Lua dispatch, fall back to the
@@ -139,35 +133,6 @@ active_workspace_id() {
   hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // empty' 2>/dev/null || true
 }
 
-# Capture a screenshot of the window so the picker can show it as a thumbnail.
-# A full-resolution grim capture is fine; Omarchy's image picker downscales it
-# with vipsthumbnail. ImageMagick, when present, just keeps the file smaller.
-make_preview() {
-  local info="$1" address="$2" geo preview resized
-  have grim || return 0
-
-  geo=$(printf '%s' "$info" | jq -r 'if (.at and .size) then "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])" else empty end' 2>/dev/null || true)
-  [ -n "$geo" ] || return 0
-
-  preview="$PREVIEW_DIR/${address}.png"
-  grim -g "$geo" "$preview" >/dev/null 2>&1 || return 0
-
-  if have magick || have convert; then
-    resized="$PREVIEW_DIR/${address}.resized.png"
-    if have magick; then
-      magick "$preview" -resize '1280x720>' "$resized" >/dev/null 2>&1 || true
-    else
-      convert "$preview" -resize '1280x720>' "$resized" >/dev/null 2>&1 || true
-    fi
-    [ -f "$resized" ] && mv -f "$resized" "$preview"
-  fi
-
-  if [ -f "$preview" ]; then
-    printf '%s' "$preview"
-  fi
-  return 0
-}
-
 restore_window() {
   local address="$1" ws
   ws=$(active_workspace_id)
@@ -180,67 +145,10 @@ restore_window() {
   state_remove "$address"
 }
 
-# True only if every minimized window still has a readable preview thumbnail.
-previews_available() {
-  local preview
-  [ "$(state_count)" -gt 0 ] || return 1
-  while IFS= read -r preview; do
-    [ -n "$preview" ] && [ -f "$preview" ] || return 1
-  done < <(jq -r '.[].preview // empty' "$STATE_FILE")
-  return 0
-}
-
-# Show a full-screen grid of live window thumbnails via Omarchy's image picker.
-# Prints the chosen window address and returns 0; 1 if the user cancelled;
-# 2 if the grid can't be used (caller then falls back to the text picker).
-thumbnail_picker() {
-  have omarchy-menu-images || return 2
-  previews_available || return 2
-
-  local tmp
-  tmp=$(mktemp -d) || return 2
-
-  local -a addrs=()
-  mapfile -t addrs < <(jq -r '.[].address' "$STATE_FILE")
-
-  # Symlink each preview under a friendly "<title> [index].png" name so the
-  # picker shows a readable label; the index maps back to the window address.
-  local i=0 a title safe preview
-  for a in "${addrs[@]}"; do
-    preview=$(jq -r --arg a "$a" '.[] | select(.address == $a) | .preview' "$STATE_FILE")
-    title=$(jq -r --arg a "$a" '.[] | select(.address == $a) | .display_title // "window"' "$STATE_FILE")
-    safe=${title//\//-}
-    safe=${safe//$'\t'/ }
-    safe=${safe//$'\n'/ }
-    safe=${safe//$'\r'/}
-    [ -n "$safe" ] || safe="window"
-    ln -s "$preview" "$tmp/$safe [$i].png"
-    i=$((i + 1))
-  done
-
-  local sel
-  if ! sel=$(omarchy-menu-images --show-labels --filterable --print-name "$tmp"); then
-    rm -rf "$tmp"
-    return 2
-  fi
-  rm -rf "$tmp"
-
-  [ -n "$sel" ] || return 1
-
-  local idx="${sel##*[}"
-  idx="${idx%]}"
-  if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -ge "${#addrs[@]}" ]; then
-    log "restore: could not parse picker selection '$sel' as an index"
-    return 1
-  fi
-
-  printf '%s' "${addrs[$idx]}"
-}
-
 cmd_minimize() {
   ensure_state
 
-  local info address class title icon preview
+  local info address class title icon
   info=$(hyprctl activewindow -j 2>/dev/null || true)
   address=$(printf '%s' "$info" | jq -r '.address // empty' 2>/dev/null || true)
   if [ -z "$address" ] || [ "$address" = "0x0" ]; then
@@ -252,8 +160,7 @@ cmd_minimize() {
   [ -n "$title" ] || title="$class"
 
   icon=$(icon_for_class "$class")
-  preview=$(make_preview "$info" "$address")
-  state_add "$address" "$title" "$class" "$preview" "$icon"
+  state_add "$address" "$title" "$class" "$icon"
 
   if ! move_window "$address" "special:$SPECIAL_WORKSPACE" "movetoworkspacesilent"; then
     log "minimize: movetoworkspacesilent failed for class=$class address=$address"
@@ -264,7 +171,7 @@ cmd_minimize() {
 cmd_restore() {
   ensure_state
 
-  local addr="${1:-}" count sel idx
+  local addr="${1:-}" count=0 sel idx
   if [ -n "$addr" ]; then
     state_has_address "$addr" || fail "No minimized window with address $addr"
     restore_window "$addr"
@@ -274,19 +181,6 @@ cmd_restore() {
   count=$(state_count)
   [ "$count" -gt 0 ] || fail "No minimized windows"
 
-  # Prefer the thumbnail grid: show every minimized window as a live preview.
-  # rc 0 = a window was chosen, 1 = the user cancelled, 2 = grid unavailable.
-  local rc=0
-  addr=$(thumbnail_picker) || rc=$?
-  if [ "$rc" -eq 0 ]; then
-    restore_window "$addr"
-    return 0
-  fi
-  if [ "$rc" -eq 1 ]; then
-    return 0
-  fi
-
-  # Fall back to the text picker (icon + title).
   have omarchy-menu-select || fail "omarchy-menu-select not found (required for the picker)"
 
   local -a opts=()
@@ -320,7 +214,7 @@ cmd_restore_all() {
   count=$(state_count)
   [ "$count" -gt 0 ] || fail "No minimized windows"
 
-  local ws addr last preview
+  local ws addr last
   ws=$(active_workspace_id)
   while IFS= read -r addr; do
     [ -n "$addr" ] || continue
@@ -333,11 +227,6 @@ cmd_restore_all() {
   if [ -n "$last" ]; then
     focus_window "$last" || true
   fi
-
-  while IFS= read -r preview; do
-    [ -n "$preview" ] || continue
-    rm -f "$preview"
-  done < <(jq -r '.[].preview // empty' "$STATE_FILE")
 
   printf '[]\n' >"$STATE_FILE"
 }

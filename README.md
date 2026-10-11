@@ -5,30 +5,28 @@
 
 A real **minimize / restore** workflow for [Omarchy](https://omarchy.org/) (Hyprland) — the feature Hyprland doesn't ship with.
 
-Hyprland has no concept of "minimizing": a window is either on a workspace or hidden on a *special* workspace. **OmaVeil** turns a dedicated `special:minimum` workspace into a proper minimize stack. Press `Super+H` to hide the focused window, `Super+I` to browse everything you've hidden (with live thumbnails, using Omarchy's own native menu), and restore with one key. No daemon, no build step, no dependencies beyond what Omarchy already ships.
+Hyprland has no concept of "minimizing": a window is either on a workspace or hidden on a *special* workspace. **OmaVeil** turns a dedicated `special:minimum` workspace into a proper minimize stack. Press `Super+H` to hide the focused window, `Super+I` to browse everything you've hidden (a compact icon + title list in Omarchy's own native menu), and restore with one key. No daemon, no build step, no dependencies beyond what Omarchy already ships.
 
 ```
         Super+H                 Super+I                          Super+U
  ┌───────────────┐      ┌────────────────────────┐      ┌──────────────────────┐
- │ focused window│      │  ┌──────┐ ┌──────┐     │      │  most recent window  │
- │  → hidden     │  →   │  │Brave │ │ Code │ ... │  →   │  → back on screen    │
- │ on special:   │      │  └──────┘ └──────┘     │      │                      │
- │   minimum     │      │  live thumbnails grid   │      │  Super+Shift+U = all │
+ │ focused window│      │  Brave — YouTube       │      │  most recent window  │
+ │  → hidden     │  →   │  Code — omaveil        │  →   │  → back on screen    │
+ │ on special:   │      │  Ghostty — ~/dev       │      │                      │
+ │   minimum     │      │  compact icon+title    │      │  Super+Shift+U = all │
  └───────────────┘      └────────────────────────┘      └──────────────────────┘
 ```
 
 ## Features
 
 - **`Super+H` — minimize** the focused window into the `minimum` special workspace.
-- **`Super+I` — browse & restore** every minimized window as a **grid of live
-  thumbnails** (a `grim` screenshot of each window), rendered by Omarchy's own
-  image picker. Filters as you type; falls back to a text list (icon + title)
-  when previews aren't available.
+- **`Super+I` — browse & restore** every minimized window from a compact
+  icon + title list rendered by Omarchy's own native menu
+  (`omarchy-menu-select`). Filters as you type.
 - **`Super+U` — restore the last** window you minimized.
 - **`Super+Shift+U` — restore all** minimized windows at once.
-- **Omarchy-native** — uses `omarchy-menu-images` for the thumbnail grid and
-  `omarchy-menu-select` for the fallback, and Hyprland's Lua dispatch
-  (`hl.dsp.window.move`) with an automatic fallback to the legacy
+- **Omarchy-native** — uses `omarchy-menu-select` for the picker and Hyprland's
+  Lua dispatch (`hl.dsp.window.move`) with an automatic fallback to the legacy
   `movetoworkspacesilent` / `movetoworkspace` / `focuswindow` dispatchers.
 - **Bar-widget friendly** — `omaveil show` prints status JSON (text/class/tooltip)
   for a custom bar module.
@@ -39,14 +37,9 @@ Hyprland has no concept of "minimizing": a window is either on a workspace or hi
 
 - **Omarchy** on Arch Linux (Hyprland + the Omarchy shell).
 - `bash`, `hyprctl`, `jq`.
-- `grim` — captures the per-window thumbnails.
-- `omarchy-menu-images` + `vipsthumbnail` (libvips) — the thumbnail grid.
-  Both ship with Omarchy.
-- `omarchy-menu-select` (ships with Omarchy) — the text-list fallback.
-- **Optional:** ImageMagick (`magick` or `convert`) keeps preview files smaller;
-  the grid works fine without it.
+- `omarchy-menu-select` (ships with Omarchy) — the picker.
 
-Everything except ImageMagick is already present on an Omarchy install.
+Everything is already present on an Omarchy install.
 
 ## Installation
 
@@ -108,7 +101,6 @@ omaveil --version
 | --- | --- | --- |
 | `OMAVEIL_WORKSPACE` | `minimum` | Name of the special workspace used for the stack. |
 | `OMAVEIL_STATE_DIR` | `/tmp/minimize-state` | Where `windows.json` is kept. |
-| `OMAVEIL_PREVIEW_DIR` | `/tmp/window-previews` | Where thumbnails are kept. |
 | `OMAVEIL_LOG` | `/tmp/omaveil.log` | Error log. |
 
 Because minimized windows don't survive a reboot, the state is intentionally
@@ -133,19 +125,15 @@ your own apps.
 ## How it works
 
 1. **Minimize** — `omaveil` reads the focused window with
-   `hyprctl activewindow -j`, captures its geometry, takes a `grim` screenshot
-   (kept at full resolution), records the window (address, title, class, icon,
-   preview) in `windows.json`, then moves it to `special:minimum` with
+   `hyprctl activewindow -j`, records the window (address, title, class, icon)
+   in `windows.json`, then moves it to `special:minimum` with
    `hl.dsp.window.move`.
 2. **Restore** — it looks up the current workspace with
    `hyprctl activeworkspace -j`, moves the window out of the special workspace
    onto it, focuses it, and drops it from the state file.
-3. **Picker** — `Super+I` symlinks each preview under a readable
-   `<title> [index].png` name and opens Omarchy's image picker
-   (`omarchy-menu-images`) over them, so you choose from a grid of live window
-   thumbnails; the chosen index maps back to the window address. If previews or
-   the image picker aren't available it falls back to an
-   `omarchy-menu-select` list of `<icon>` + title.
+3. **Picker** — `Super+I` opens Omarchy's native menu
+   (`omarchy-menu-select`) listing each minimized window as `<icon>` + title;
+   the chosen index maps back to the window address.
 
 If a Hyprland Lua dispatch isn't available, every operation falls back to the
 equally-capable legacy dispatchers, so the tool keeps working across Hyprland
@@ -177,9 +165,6 @@ This removes `~/.local/bin/omaveil` and the runtime state. The entries in
   required; make sure the Omarchy shell is running.
 - **Wrong window gets minimized** — `omaveil` acts on Hyprland's *active*
   window. If a keybinding runs before focus settles, try again.
-- **`Super+I` shows a text list instead of thumbnails** — the grid needs
-  `grim` (to capture) and `omarchy-menu-images` + `vipsthumbnail` (to render).
-  Without a preview it silently falls back to the text picker.
 - **Wrong window gets minimized** — `omaveil` acts on Hyprland's *active*
   window. If a keybinding runs before focus settles, try again.
 - **Nothing appears after a reboot** — expected: minimized state lives in `/tmp`.
