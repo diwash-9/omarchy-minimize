@@ -52,10 +52,26 @@ for cmd in hyprctl jq grim omarchy-menu-select; do
     echo "  MISSING: $cmd"
   fi
 done
+for cmd in omarchy-menu-images vipsthumbnail; do
+  if command -v "$cmd" >/dev/null 2>&1; then
+    echo "  ok: $cmd (thumbnail grid)"
+  else
+    echo "  optional: $cmd not found (thumbnail grid disabled)"
+  fi
+done
 if command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1; then
-  echo "  ok: imagemagick (window thumbnails)"
+  echo "  ok: imagemagick (smaller previews)"
 else
-  echo "  optional: imagemagick not found (thumbnails disabled)"
+  echo "  optional: imagemagick not found"
+fi
+
+# Warn if an older `omaveil` earlier in PATH would shadow this install.
+resolved=$(command -v omaveil 2>/dev/null || true)
+if [ -n "$resolved" ] && [ "$resolved" != "$BIN_DIR/omaveil" ]; then
+  echo
+  echo "WARNING: 'omaveil' currently resolves to $resolved,"
+  echo "         which shadows $BIN_DIR/omaveil."
+  echo "         Remove the old one (e.g. sudo rm $resolved) to use this version."
 fi
 
 cat <<'EOF'

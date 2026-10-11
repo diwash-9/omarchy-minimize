@@ -23,7 +23,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 STATE_DIR="${OMAVEIL_STATE_DIR:-/tmp/minimize-state}"
 PREVIEW_DIR="${OMAVEIL_PREVIEW_DIR:-/tmp/window-previews}"
@@ -139,26 +139,31 @@ active_workspace_id() {
   hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // empty' 2>/dev/null || true
 }
 
+# Capture a screenshot of the window so the picker can show it as a thumbnail.
+# A full-resolution grim capture is fine; Omarchy's image picker downscales it
+# with vipsthumbnail. ImageMagick, when present, just keeps the file smaller.
 make_preview() {
-  local info="$1" address="$2" geo raw thumb
+  local info="$1" address="$2" geo preview resized
   have grim || return 0
-  have magick || have convert || return 0
 
   geo=$(printf '%s' "$info" | jq -r 'if (.at and .size) then "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])" else empty end' 2>/dev/null || true)
   [ -n "$geo" ] || return 0
 
-  raw="$PREVIEW_DIR/${address}.png"
-  thumb="$PREVIEW_DIR/${address}.thumb.png"
-  grim -g "$geo" "$raw" >/dev/null 2>&1 || return 0
+  preview="$PREVIEW_DIR/${address}.png"
+  grim -g "$geo" "$preview" >/dev/null 2>&1 || return 0
 
-  if have magick; then
-    magick "$raw" -resize '200x150^' -gravity center -extent 200x150 "$thumb" >/dev/null 2>&1 || true
-  else
-    convert "$raw" -resize '200x150^' -gravity center -extent 200x150 "$thumb" >/dev/null 2>&1 || true
+  if have magick || have convert; then
+    resized="$PREVIEW_DIR/${address}.resized.png"
+    if have magick; then
+      magick "$preview" -resize '1280x720>' "$resized" >/dev/null 2>&1 || true
+    else
+      convert "$preview" -resize '1280x720>' "$resized" >/dev/null 2>&1 || true
+    fi
+    [ -f "$resized" ] && mv -f "$resized" "$preview"
   fi
-  rm -f "$raw"
-  if [ -f "$thumb" ]; then
-    printf '%s' "$thumb"
+
+  if [ -f "$preview" ]; then
+    printf '%s' "$preview"
   fi
   return 0
 }
@@ -173,6 +178,63 @@ restore_window() {
   fi
   focus_window "$address" || log "restore: focuswindow failed for address=$address"
   state_remove "$address"
+}
+
+# True only if every minimized window still has a readable preview thumbnail.
+previews_available() {
+  local preview
+  [ "$(state_count)" -gt 0 ] || return 1
+  while IFS= read -r preview; do
+    [ -n "$preview" ] && [ -f "$preview" ] || return 1
+  done < <(jq -r '.[].preview // empty' "$STATE_FILE")
+  return 0
+}
+
+# Show a full-screen grid of live window thumbnails via Omarchy's image picker.
+# Prints the chosen window address and returns 0; 1 if the user cancelled;
+# 2 if the grid can't be used (caller then falls back to the text picker).
+thumbnail_picker() {
+  have omarchy-menu-images || return 2
+  previews_available || return 2
+
+  local tmp
+  tmp=$(mktemp -d) || return 2
+
+  local -a addrs=()
+  mapfile -t addrs < <(jq -r '.[].address' "$STATE_FILE")
+
+  # Symlink each preview under a friendly "<title> [index].png" name so the
+  # picker shows a readable label; the index maps back to the window address.
+  local i=0 a title safe preview
+  for a in "${addrs[@]}"; do
+    preview=$(jq -r --arg a "$a" '.[] | select(.address == $a) | .preview' "$STATE_FILE")
+    title=$(jq -r --arg a "$a" '.[] | select(.address == $a) | .display_title // "window"' "$STATE_FILE")
+    safe=${title//\//-}
+    safe=${safe//$'\t'/ }
+    safe=${safe//$'\n'/ }
+    safe=${safe//$'\r'/}
+    [ -n "$safe" ] || safe="window"
+    ln -s "$preview" "$tmp/$safe [$i].png"
+    i=$((i + 1))
+  done
+
+  local sel
+  if ! sel=$(omarchy-menu-images --show-labels --filterable --print-name "$tmp"); then
+    rm -rf "$tmp"
+    return 2
+  fi
+  rm -rf "$tmp"
+
+  [ -n "$sel" ] || return 1
+
+  local idx="${sel##*[}"
+  idx="${idx%]}"
+  if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -ge "${#addrs[@]}" ]; then
+    log "restore: could not parse picker selection '$sel' as an index"
+    return 1
+  fi
+
+  printf '%s' "${addrs[$idx]}"
 }
 
 cmd_minimize() {
@@ -211,6 +273,20 @@ cmd_restore() {
 
   count=$(state_count)
   [ "$count" -gt 0 ] || fail "No minimized windows"
+
+  # Prefer the thumbnail grid: show every minimized window as a live preview.
+  # rc 0 = a window was chosen, 1 = the user cancelled, 2 = grid unavailable.
+  local rc=0
+  addr=$(thumbnail_picker) || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    restore_window "$addr"
+    return 0
+  fi
+  if [ "$rc" -eq 1 ]; then
+    return 0
+  fi
+
+  # Fall back to the text picker (icon + title).
   have omarchy-menu-select || fail "omarchy-menu-select not found (required for the picker)"
 
   local -a opts=()
