@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+#
+# omaveil - Omarchy-native window minimizer for Hyprland.
+#
+# Hyprland has no "minimize": windows are either on a workspace or hidden on a
+# special workspace. omaveil gives you a real minimize/restore workflow on top
+# of a dedicated special workspace, with an Omarchy-native picker and live
+# thumbnails of every hidden window.
+#
+# Commands:
+#   minimize              Hide the focused window into special:minimum
+#   restore               Open the picker and restore a chosen window
+#   restore <address>     Restore one window by its Hyprland address
+#   restore-last          Restore the most recently minimized window
+#   restore-all           Restore every minimized window
+#   show                  Print status JSON (for a bar widget)
+#
+# Environment overrides:
+#   OMAVEIL_STATE_DIR     where windows.json lives   (default /tmp/minimize-state)
+#   OMAVEIL_PREVIEW_DIR   where thumbnails live      (default /tmp/window-previews)
+#   OMAVEIL_LOG           error log                  (default /tmp/omaveil.log)
+#   OMAVEIL_WORKSPACE     special workspace name     (default minimum)
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+STATE_DIR="${OMAVEIL_STATE_DIR:-/tmp/minimize-state}"
+PREVIEW_DIR="${OMAVEIL_PREVIEW_DIR:-/tmp/window-previews}"
+STATE_FILE="$STATE_DIR/windows.json"
+LOG_FILE="${OMAVEIL_LOG:-/tmp/omaveil.log}"
+SPECIAL_WORKSPACE="${OMAVEIL_WORKSPACE:-minimum}"
+
+# Nerd Font glyphs (see the README to customize these).
+ICON_STATUS=$'\U000f0638'
+ICON_DEFAULT=$'\U000f0a1e'
+ICON_BROWSER=$'\U000f059f'
+ICON_TERMINAL=$'\U000f066f'
+ICON_CODE=$'\U000f05b2'
+ICON_GAME=$'\U000f0292'
+ICON_MEDIA=$'\U000f075a'
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+notify() {
+  if have notify-send; then
+    notify-send -a OmaVeil "$1" 2>/dev/null || true
+  fi
+}
+
+fail() {
+  log "ERROR: $*"
+  notify "$*"
+  printf 'omaveil: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+OmaVeil - Omarchy-native window minimizer for Hyprland
+
+Usage: omaveil <command> [window_address]
+
+Commands:
+  minimize       Hide the focused window into special:$SPECIAL_WORKSPACE
+  restore        Open Omarchy's native picker to restore a window
+  restore [addr] Restore a specific window by address
+  restore-last   Restore the most recently minimized window
+  restore-all    Restore all minimized windows
+  show           Print status JSON
+
+Errors: $LOG_FILE
+EOF
+}
+
+icon_for_class() {
+  local class="${1,,}"
+  case "$class" in
+    *firefox*|*chromium*|*chrome*|*brave*|*zen*|*vivaldi*|*edge*|*opera*|*browser*) printf '%s' "$ICON_BROWSER" ;;
+    *alacritty*|*kitty*|*ghostty*|*foot*|*wezterm*|*konsole*|*terminal*)             printf '%s' "$ICON_TERMINAL" ;;
+    *code*|*codium*|*nvim*|*neovim*|*emacs*|*sublime*|*jetbrains*|*idea*)            printf '%s' "$ICON_CODE" ;;
+    *steam*|*lutris*|*heroic*|*deadlock*|*game*)                                     printf '%s' "$ICON_GAME" ;;
+    *spotify*|*discord*|*mpv*|*vlc*|*music*)                                         printf '%s' "$ICON_MEDIA" ;;
+    *)                                                                               printf '%s' "$ICON_DEFAULT" ;;
+  esac
+}
+
+ensure_state() {
+  mkdir -p "$STATE_DIR" "$PREVIEW_DIR"
+  [ -f "$STATE_FILE" ] || printf '[]\n' >"$STATE_FILE"
+}
+
+state_count() {
+  jq 'length' "$STATE_FILE" 2>/dev/null || printf '0'
+}
+
+state_has_address() {
+  jq -e --arg a "$1" 'any(.[]; .address == $a)' "$STATE_FILE" >/dev/null 2>&1
+}
+
+state_add() {
+  local address="$1" title="$2" class="$3" preview="$4" icon="$5"
+  jq --arg a "$address" --arg d "$title" --arg c "$class" --arg o "$title" --arg p "$preview" --arg i "$icon" \
+    '. + [{address:$a, display_title:$d, class:$c, original_title:$o, preview:$p, icon:$i}]' \
+    "$STATE_FILE" >"$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+state_remove() {
+  local address="$1" preview
+  preview=$(jq -r --arg a "$address" '.[] | select(.address == $a) | .preview // empty' "$STATE_FILE" 2>/dev/null | head -n1)
+  jq --arg a "$address" 'map(select(.address != $a))' "$STATE_FILE" >"$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  [ -n "$preview" ] && rm -f "$preview"
+  return 0
+}
+
+# Move a window to a workspace: prefer Hyprland's Lua dispatch, fall back to the
+# legacy dispatcher name so this keeps working across Hyprland versions.
+move_window() {
+  local address="$1" workspace="$2" fallback="$3"
+  if hyprctl dispatch "hl.dsp.window.move({ workspace = \"$workspace\", follow = false, window = \"address:$address\" })" >/dev/null 2>&1; then
+    return 0
+  fi
+  hyprctl dispatch "$fallback" "$workspace,address:$address" >/dev/null 2>&1
+}
+
+focus_window() {
+  local address="$1"
+  if hyprctl dispatch "hl.dsp.focus({ window = \"address:$address\" })" >/dev/null 2>&1; then
+    return 0
+  fi
+  hyprctl dispatch focuswindow "address:$address" >/dev/null 2>&1
+}
+
+active_workspace_id() {
+  hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // empty' 2>/dev/null || true
+}
+
+make_preview() {
+  local info="$1" address="$2" geo raw thumb
+  have grim || return 0
+  have magick || have convert || return 0
+
+  geo=$(printf '%s' "$info" | jq -r 'if (.at and .size) then "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])" else empty end' 2>/dev/null || true)
+  [ -n "$geo" ] || return 0
+
+  raw="$PREVIEW_DIR/${address}.png"
+  thumb="$PREVIEW_DIR/${address}.thumb.png"
+  grim -g "$geo" "$raw" >/dev/null 2>&1 || return 0
+
+  if have magick; then
+    magick "$raw" -resize '200x150^' -gravity center -extent 200x150 "$thumb" >/dev/null 2>&1 || true
+  else
+    convert "$raw" -resize '200x150^' -gravity center -extent 200x150 "$thumb" >/dev/null 2>&1 || true
+  fi
+  rm -f "$raw"
+  if [ -f "$thumb" ]; then
+    printf '%s' "$thumb"
+  fi
+  return 0
+}
+
+restore_window() {
+  local address="$1" ws
+  ws=$(active_workspace_id)
+  if [ -n "$ws" ]; then
+    move_window "$address" "$ws" "movetoworkspace" || log "restore: movetoworkspace failed for address=$address"
+  else
+    log "restore: hyprctl activeworkspace failed for address=$address"
+  fi
+  focus_window "$address" || log "restore: focuswindow failed for address=$address"
+  state_remove "$address"
+}
+
+cmd_minimize() {
+  ensure_state
+
+  local info address class title icon preview
+  info=$(hyprctl activewindow -j 2>/dev/null || true)
+  address=$(printf '%s' "$info" | jq -r '.address // empty' 2>/dev/null || true)
+  if [ -z "$address" ] || [ "$address" = "0x0" ]; then
+    fail "No active window to minimize"
+  fi
+  class=$(printf '%s' "$info" | jq -r '.class // empty' 2>/dev/null || true)
+  title=$(printf '%s' "$info" | jq -r '.title // empty' 2>/dev/null || true)
+  [ -n "$class" ] || class="unknown"
+  [ -n "$title" ] || title="$class"
+
+  icon=$(icon_for_class "$class")
+  preview=$(make_preview "$info" "$address")
+  state_add "$address" "$title" "$class" "$preview" "$icon"
+
+  if ! move_window "$address" "special:$SPECIAL_WORKSPACE" "movetoworkspacesilent"; then
+    log "minimize: movetoworkspacesilent failed for class=$class address=$address"
+    fail "Could not minimize $class"
+  fi
+}
+
+cmd_restore() {
+  ensure_state
+
+  local addr="${1:-}" count sel idx
+  if [ -n "$addr" ]; then
+    state_has_address "$addr" || fail "No minimized window with address $addr"
+    restore_window "$addr"
+    return 0
+  fi
+
+  count=$(state_count)
+  [ "$count" -gt 0 ] || fail "No minimized windows"
+  have omarchy-menu-select || fail "omarchy-menu-select not found (required for the picker)"
+
+  local -a opts=()
+  mapfile -t opts < <(jq -r 'to_entries[] | "\(.value.icon)\t\(.value.display_title | gsub("[\t\r\n]"; " "))\t\(.key)"' "$STATE_FILE")
+
+  if ! sel=$(omarchy-menu-select "Restore window:" "${opts[@]}"); then
+    return 0
+  fi
+
+  idx="${sel##*$'\t'}"
+  if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -ge "$count" ]; then
+    log "restore: could not parse omarchy-menu-select output '$sel' as an index"
+    return 1
+  fi
+
+  addr=$(jq -r --argjson i "$idx" '.[$i].address' "$STATE_FILE")
+  restore_window "$addr"
+}
+
+cmd_restore_last() {
+  ensure_state
+  local addr
+  addr=$(jq -r '.[-1].address // empty' "$STATE_FILE" 2>/dev/null || true)
+  [ -n "$addr" ] || fail "No minimized windows"
+  restore_window "$addr"
+}
+
+cmd_restore_all() {
+  ensure_state
+  local count
+  count=$(state_count)
+  [ "$count" -gt 0 ] || fail "No minimized windows"
+
+  local ws addr last preview
+  ws=$(active_workspace_id)
+  while IFS= read -r addr; do
+    [ -n "$addr" ] || continue
+    if [ -n "$ws" ]; then
+      move_window "$addr" "$ws" "movetoworkspace" || log "restore: movetoworkspace failed for address=$addr"
+    fi
+  done < <(jq -r '.[].address' "$STATE_FILE")
+
+  last=$(jq -r '.[-1].address // empty' "$STATE_FILE")
+  if [ -n "$last" ]; then
+    focus_window "$last" || true
+  fi
+
+  while IFS= read -r preview; do
+    [ -n "$preview" ] || continue
+    rm -f "$preview"
+  done < <(jq -r '.[].preview // empty' "$STATE_FILE")
+
+  printf '[]\n' >"$STATE_FILE"
+}
+
+cmd_show() {
+  ensure_state
+  local count
+  count=$(state_count)
+  if [ "$count" -eq 0 ]; then
+    printf '{"text":"%s","class":"empty","tooltip":"No minimized windows"}\n' "$ICON_STATUS"
+  else
+    printf '{"text":"%s %s","class":"has-windows","tooltip":"%s minimized windows"}\n' "$ICON_STATUS" "$count" "$count"
+  fi
+}
+
+main() {
+  case "${1:-}" in
+    minimize)     shift; cmd_minimize "$@" ;;
+    restore)      shift; cmd_restore "$@" ;;
+    restore-last) shift; cmd_restore_last "$@" ;;
+    restore-all)  shift; cmd_restore_all "$@" ;;
+    show)         shift; cmd_show "$@" ;;
+    ""|-h|--help|help) usage ;;
+    -v|--version) printf 'omaveil %s\n' "$VERSION" ;;
+    *)
+      printf 'omaveil: unknown command: %s\n\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

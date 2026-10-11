@@ -1,0 +1,24 @@
+name: Checks
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  shell:
+    name: Shell checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Syntax check
+        run: |
+          for f in bin/omaveil install.sh uninstall.sh; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+
+      - name: ShellCheck
+        run: shellcheck bin/omaveil install.sh uninstall.sh
